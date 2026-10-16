@@ -5,14 +5,13 @@
 # ============================================================
 # This script:
 #   1. Closes Chrome
-#   2. Backs up existing Chrome policy plists
-#   3. Disables local AI models / Gemini / AI Mode
+#   2. Backs up the existing Chrome managed-policy plist
+#   3. Disables local AI model / Gemini / AI Mode via system policy
 #   4. Deletes downloaded local AI models
+#   5. Verifies the result
 #
 # Bookmarks, passwords, history, and extensions are untouched.
 # ============================================================
-
-set -e
 
 # ------------------------------------------------------------
 # Check for macOS
@@ -23,27 +22,38 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 
 # ------------------------------------------------------------
-# Admin privileges check & auto‑elevation
+# Admin privileges check & auto-elevation
+# (run through /bin/bash so the executable bit is not required)
 # ------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
     echo "Administrator privileges are required to set system policies."
-    echo "Re‑running with sudo..."
-    sudo "$0" "$@"
-    exit $?
+    echo "Re-running with sudo..."
+    exec sudo /bin/bash "$0" "$@"
+fi
+
+# ------------------------------------------------------------
+# Work out the REAL user. Under sudo, "$HOME" / "defaults" /
+# "mkdir" may point at or create files owned by root.
+# ------------------------------------------------------------
+REAL_USER="${SUDO_USER:-$(stat -f '%Su' /dev/console)}"
+REAL_HOME="$(dscl . -read "/Users/$REAL_USER" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory: *//')"
+
+if [[ -z "$REAL_USER" || "$REAL_USER" == "root" || ! -d "$REAL_HOME" ]]; then
+    echo "[ERROR] Could not determine the logged-in user's home folder."
+    echo "        Run this script with 'sudo' from your normal user account."
+    exit 1
 fi
 
 # ------------------------------------------------------------
 # Variables
 # ------------------------------------------------------------
-CHROME_USER_DATA="$HOME/Library/Application Support/Google/Chrome"
-BACKUP_DIR="$HOME/Desktop/Chrome_AI_Backup"
-SYSTEM_PLIST="/Library/Managed Preferences/com.google.Chrome.plist"
-USER_PLIST="$HOME/Library/Preferences/com.google.Chrome.plist"
-
-# ------------------------------------------------------------
-# Create backup directory
-# ------------------------------------------------------------
-mkdir -p "$BACKUP_DIR"
+CHROME_USER_DATA="$REAL_HOME/Library/Application Support/Google/Chrome"
+BACKUP_DIR="$REAL_HOME/Desktop/Chrome_AI_Backup"
+POLICY_DIR="/Library/Managed Preferences"
+SYSTEM_PLIST="$POLICY_DIR/com.google.Chrome.plist"
+BACKUP_FILE="$BACKUP_DIR/Chrome_System_Managed.plist"
+PB="/usr/libexec/PlistBuddy"
+POLICIES=(GenAILocalFoundationalModelSettings GeminiSettings AIModeSettings)
 
 echo "============================================================"
 echo "          GOOGLE CHROME - AI CLEANER (macOS)"
@@ -52,9 +62,10 @@ echo
 echo "This script will:"
 echo
 echo "  [1] Close Chrome"
-echo "  [2] Backup existing policy files"
+echo "  [2] Back up the existing policy file"
 echo "  [3] Disable Chrome AI features (system policy)"
 echo "  [4] Remove downloaded local AI models"
+echo "  [5] Verify the result"
 echo
 echo "Bookmarks, passwords, history and extensions are NOT touched."
 echo
@@ -62,68 +73,72 @@ read -p "Press any key to continue..." -n1 -s
 echo
 
 # ------------------------------------------------------------
-# 1. Close Chrome
+# [1/5] Close Chrome
 # ------------------------------------------------------------
 echo
 echo "============================================================"
 echo "[1/5] Closing Chrome"
 echo "============================================================"
-pkill -x "Google Chrome" 2>/dev/null || echo "Chrome was not running."
-sleep 2
-echo "[OK] Chrome closed."
+if pgrep -x "Google Chrome" >/dev/null 2>&1; then
+    sudo -u "$REAL_USER" osascript -e 'tell application "Google Chrome" to quit' >/dev/null 2>&1
+    sleep 3
+    pkill -x "Google Chrome" 2>/dev/null
+    sleep 1
+    echo "[OK] Chrome closed."
+else
+    echo "[INFO] Chrome was not running."
+fi
 
 # ------------------------------------------------------------
-# 2. Backup policy plists
+# [2/5] Backup policy plist
+# An existing backup is NEVER overwritten, so re-running the
+# script cannot replace your original settings with modified ones.
 # ------------------------------------------------------------
 echo
 echo "============================================================"
-echo "[2/5] Backing up policy files"
+echo "[2/5] Backing up policy file"
 echo "============================================================"
 
-if [[ -f "$SYSTEM_PLIST" ]]; then
-    cp "$SYSTEM_PLIST" "$BACKUP_DIR/Chrome_System_Managed.plist"
-    echo "[OK] System policy backed up."
-else
-    echo "[INFO] No existing system policy file found."
-fi
+mkdir -p "$BACKUP_DIR"
 
-if [[ -f "$USER_PLIST" ]]; then
-    cp "$USER_PLIST" "$BACKUP_DIR/Chrome_User_Defaults.plist"
-    echo "[OK] User defaults backed up."
+if [[ -f "$BACKUP_FILE" ]]; then
+    echo "[INFO] Backup already exists, keeping the original."
+elif [[ -f "$SYSTEM_PLIST" ]]; then
+    cp "$SYSTEM_PLIST" "$BACKUP_FILE" && echo "[OK] System policy backed up."
 else
-    echo "[INFO] No existing user defaults file found."
+    echo "[INFO] No existing system policy file found, nothing to back up."
 fi
+chown -R "$REAL_USER" "$BACKUP_DIR"
 
 # ------------------------------------------------------------
-# 3. Disable AI features via system policy
+# [3/5] Disable AI features via system (managed) policy
+# Chrome on macOS only honours *managed* preferences, so
+# "defaults write com.google.Chrome ..." would have no effect.
 # ------------------------------------------------------------
 echo
 echo "============================================================"
 echo "[3/5] Disabling Chrome AI features"
 echo "============================================================"
 
-# Create or modify the system‑wide managed preferences plist
-/usr/libexec/PlistBuddy -c "Add :GenAILocalFoundationalModelSettings integer 1" "$SYSTEM_PLIST" 2>/dev/null || \
-/usr/libexec/PlistBuddy -c "Set :GenAILocalFoundationalModelSettings 1" "$SYSTEM_PLIST"
+mkdir -p "$POLICY_DIR"
 
-/usr/libexec/PlistBuddy -c "Add :GeminiSettings integer 1" "$SYSTEM_PLIST" 2>/dev/null || \
-/usr/libexec/PlistBuddy -c "Set :GeminiSettings 1" "$SYSTEM_PLIST"
+for key in "${POLICIES[@]}"; do
+    if "$PB" -c "Add :$key integer 1" "$SYSTEM_PLIST" >/dev/null 2>&1 \
+    || "$PB" -c "Set :$key 1" "$SYSTEM_PLIST" >/dev/null 2>&1; then
+        echo "[OK] $key = 1"
+    else
+        echo "[ERROR] Could not set $key"
+    fi
+done
 
-/usr/libexec/PlistBuddy -c "Add :AIModeSettings integer 1" "$SYSTEM_PLIST" 2>/dev/null || \
-/usr/libexec/PlistBuddy -c "Set :AIModeSettings 1" "$SYSTEM_PLIST"
-
-# Also set them in user defaults (as a fallback)
-defaults write com.google.Chrome GenAILocalFoundationalModelSettings -int 1
-defaults write com.google.Chrome GeminiSettings -int 1
-defaults write com.google.Chrome AIModeSettings -int 1
-
-echo "[OK] AI policies set:"
-echo "     GenAILocalFoundationalModelSettings = 1"
-echo "     GeminiSettings = 1"
-echo "     AIModeSettings = 1"
+# Correct ownership/permissions and drop the preferences cache
+# so the new values are picked up without a reboot.
+chown root:wheel "$SYSTEM_PLIST" 2>/dev/null
+chmod 644 "$SYSTEM_PLIST" 2>/dev/null
+killall cfprefsd 2>/dev/null
 
 # ------------------------------------------------------------
-# 4. Delete local AI models
+# [4/5] Delete local AI models
 # ------------------------------------------------------------
 echo
 echo "============================================================"
@@ -136,77 +151,59 @@ else
     echo "Chrome User Data: $CHROME_USER_DATA"
     echo
 
-    # -----------------------------------------------------------------
-    # OptGuideOnDeviceModel
-    # -----------------------------------------------------------------
-    echo "Searching for OptGuideOnDeviceModel..."
-    find "$CHROME_USER_DATA" -type d -name "OptGuideOnDeviceModel" -print0 | while IFS= read -r -d '' dir; do
-        echo "[FOUND] $dir"
-        echo "[DELETE] Removing..."
-        rm -rf "$dir" 2>/dev/null && echo "[OK] Removed." || echo "[WARNING] Could not remove."
-        echo
-    done
-
-    # -----------------------------------------------------------------
-    # OnDeviceModel
-    # -----------------------------------------------------------------
-    echo "Searching for OnDeviceModel..."
-    find "$CHROME_USER_DATA" -type d -name "OnDeviceModel" -print0 | while IFS= read -r -d '' dir; do
-        echo "[FOUND] $dir"
-        echo "[DELETE] Removing..."
-        rm -rf "$dir" 2>/dev/null && echo "[OK] Removed." || echo "[WARNING] Could not remove."
-        echo
-    done
-
-    # -----------------------------------------------------------------
-    # OptimizationGuide – delete only subdirectories containing "model" or "optimization"
-    # -----------------------------------------------------------------
-    echo "Searching for OptimizationGuide subdirectories..."
-    find "$CHROME_USER_DATA" -type d -name "OptimizationGuide" -print0 | while IFS= read -r -d '' dir; do
-        echo "[FOUND] $dir"
-        # Remove subdirs that match *model* or *optimization* (case‑insensitive)
-        find "$dir" -mindepth 1 -maxdepth 1 -type d -iname "*model*" -o -iname "*optimization*" -print0 | while IFS= read -r -d '' subdir; do
-            echo "[DELETE] $subdir"
-            rm -rf "$subdir" 2>/dev/null && echo "[OK] Removed." || echo "[WARNING] Could not remove."
-        done
-        echo
-    done
-
-    # -----------------------------------------------------------------
-    # weights.bin – only if path contains AI model directories
-    # -----------------------------------------------------------------
-    echo "Searching for weights.bin AI model files..."
-    find "$CHROME_USER_DATA" -type f -name "weights.bin" -print0 | while IFS= read -r -d '' file; do
-        # Check if the file path contains one of the known AI folders
-        if [[ "$file" =~ (OptGuideOnDeviceModel|OnDeviceModel|OptimizationGuide) ]]; then
-            echo "[FOUND AI MODEL] $file"
-            echo "[DELETE] Removing..."
-            rm -f "$file" 2>/dev/null && echo "[OK] Removed." || echo "[WARNING] Could not remove."
+    for name in OptGuideOnDeviceModel OnDeviceModel; do
+        echo "Searching for $name..."
+        # -prune: do not descend into a match we are about to delete
+        while IFS= read -r -d '' dir; do
+            echo "[FOUND]  $dir"
+            if rm -rf "$dir" 2>/dev/null; then
+                echo "[OK] Removed."
+            else
+                echo "[WARNING] Could not remove."
+            fi
             echo
-        fi
+        done < <(find "$CHROME_USER_DATA" -type d -name "$name" -prune -print0 2>/dev/null)
     done
+
+    # Safety net: weights.bin still sitting inside a recognised AI folder
+    echo "Searching for leftover weights.bin..."
+    while IFS= read -r -d '' file; do
+        echo "[FOUND]  $file"
+        if rm -f "$file" 2>/dev/null; then
+            echo "[OK] Removed."
+        else
+            echo "[WARNING] Could not remove."
+        fi
+        echo
+    done < <(find "$CHROME_USER_DATA" -type f -name "weights.bin" \
+                \( -path '*/OptGuideOnDeviceModel/*' -o -path '*/OnDeviceModel/*' \) \
+                -print0 2>/dev/null)
 fi
 
 # ------------------------------------------------------------
-# 5. Verification
+# [5/5] Verification
 # ------------------------------------------------------------
 echo
 echo "============================================================"
 echo "[5/5] Verification"
 echo "============================================================"
 echo
-echo "Current system policy values:"
-/usr/libexec/PlistBuddy -c "Print :GenAILocalFoundationalModelSettings" "$SYSTEM_PLIST" 2>/dev/null || echo "  GenAILocalFoundationalModelSettings: (not set)"
-/usr/libexec/PlistBuddy -c "Print :GeminiSettings" "$SYSTEM_PLIST" 2>/dev/null || echo "  GeminiSettings: (not set)"
-/usr/libexec/PlistBuddy -c "Print :AIModeSettings" "$SYSTEM_PLIST" 2>/dev/null || echo "  AIModeSettings: (not set)"
+echo "Current system policy values ($SYSTEM_PLIST):"
+for key in "${POLICIES[@]}"; do
+    if val="$("$PB" -c "Print :$key" "$SYSTEM_PLIST" 2>/dev/null)"; then
+        echo "  $key = $val"
+    else
+        echo "  $key: (not set)"
+    fi
+done
 
 echo
 echo "============================================================"
 echo "                       DONE"
 echo "============================================================"
 echo
-echo "Backup files are stored in:"
-echo "$BACKUP_DIR"
+echo "Backup file is stored in:"
+echo "  $BACKUP_DIR"
 echo
 echo "Now start Chrome and open:"
 echo "  chrome://policy"
@@ -217,7 +214,7 @@ echo "  GeminiSettings"
 echo "  AIModeSettings"
 echo
 echo "============================================================"
-echo "		PS. Install Linux   :P"
+echo "   PS. Install Linux   :P"
 echo "============================================================"
 
 exit 0
