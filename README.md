@@ -1,3 +1,10 @@
+----------
+
+NOTE - This is a hobby project created primarily for my personal needs. 
+
+----------
+
+
 # Chrome AI Cleaner (macOS)
 
 Shell script (`removeChromeAiMAC.sh`) that disables the built-in AI features in Google Chrome on macOS (Gemini, AI Mode, local on-device AI model) and deletes the already downloaded local model files.
